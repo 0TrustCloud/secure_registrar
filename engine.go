@@ -27,6 +27,7 @@ type DomainMetadata struct {
 	OwnerPub     string    `json:"owner_pub"`
 	ParentDomain string    `json:"parent_domain"`
 	RegisteredAt time.Time `json:"registered_at"`
+	LockPolicy   string    `json:"lock_policy,omitempty"`
 }
 
 type UIField struct {
@@ -88,10 +89,52 @@ func NewRegistrarEngine(database *ultimate_db.DB, dnsService *secure_dns.SecureD
 
 func (re *RegistrarEngine) RegisterTLD(tld, adminPub string) error {
 	tld = strings.TrimSpace(strings.ToLower(tld))
-	if strings.Contains(tld, ".") {
-		return fmt.Errorf("invalid TLD format: extension zones cannot contain dots")
+	// Open namespace: any non-ICANN single-label TLD (plus intentional product overlays).
+	if err := ValidatePrivateTLD(tld); err != nil {
+		return err
+	}
+	if adminPub == "" {
+		return fmt.Errorf("admin public key is required")
 	}
 	return re.commitOwnership(tld, adminPub, "")
+}
+
+// EnsureTLD registers a private TLD if not already present (idempotent bootstrap).
+// Any non-ICANN TLD is accepted; ICANN-delegated labels are rejected (see ValidatePrivateTLD).
+func (re *RegistrarEngine) EnsureTLD(tld, adminPub string) error {
+	tld = strings.TrimSpace(strings.ToLower(tld))
+	if err := ValidatePrivateTLD(tld); err != nil {
+		return err
+	}
+	if _, err := re.GetOwnership(tld); err == nil {
+		return nil
+	}
+	return re.RegisterTLD(tld, adminPub)
+}
+
+// ListPrivateTLDs returns registered single-label TLDs (parent empty, no dots).
+func (re *RegistrarEngine) ListPrivateTLDs() ([]string, error) {
+	domains, err := re.ListDomains()
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	seen := map[string]struct{}{}
+	for _, d := range domains {
+		label := strings.ToLower(strings.TrimSpace(d.Domain))
+		if label == "" || strings.Contains(label, ".") {
+			continue
+		}
+		if d.ParentDomain != "" {
+			continue
+		}
+		if _, ok := seen[label]; ok {
+			continue
+		}
+		seen[label] = struct{}{}
+		out = append(out, label)
+	}
+	return out, nil
 }
 
 func (re *RegistrarEngine) RegisterRootDomain(domain, ownerPub string) error {
@@ -106,6 +149,18 @@ func (re *RegistrarEngine) RegisterRootDomain(domain, ownerPub string) error {
 	}
 
 	return re.commitOwnership(domain, ownerPub, parts[1])
+}
+
+// EnsureRootDomain registers a root zone if not already present (idempotent bootstrap).
+func (re *RegistrarEngine) EnsureRootDomain(domain, ownerPub string) error {
+	domain = strings.TrimSpace(strings.ToLower(domain))
+	if domain == "" {
+		return fmt.Errorf("domain is required")
+	}
+	if _, err := re.GetOwnership(domain); err == nil {
+		return nil
+	}
+	return re.RegisterRootDomain(domain, ownerPub)
 }
 
 func (re *RegistrarEngine) RegisterSubdomain(subdomain, ownerPub string) error {
@@ -136,6 +191,9 @@ func (re *RegistrarEngine) MaintainResourceRecord(callerPub, domain, recordType,
 	if meta.OwnerPub != callerPub {
 		return fmt.Errorf("access denied: configuration signature does not own namespace %s", domain)
 	}
+	if err := re.assertDNSChangeAllowed(meta, recordType); err != nil {
+		return err
+	}
 
 	return re.dns.RegisterDomain(domain, recordType, value, ttl)
 }
@@ -162,6 +220,20 @@ func (re *RegistrarEngine) UpdateUIConfig(callerPub, domain string, cfg UIConfig
 	return err
 }
 
+func (re *RegistrarEngine) ListDomains() ([]DomainMetadata, error) {
+	var domains []DomainMetadata
+	txn := re.db.BeginTxn()
+	err := re.db.Scan(RegistryPageID, txn, []byte("owner:"), func(_key, value []byte) bool {
+		var meta DomainMetadata
+		if json.Unmarshal(value, &meta) == nil {
+			domains = append(domains, meta)
+		}
+		return true
+	})
+	re.db.CommitTxn(txn)
+	return domains, err
+}
+
 func (re *RegistrarEngine) GetOwnership(domain string) (*DomainMetadata, error) {
 	domain = strings.TrimSpace(strings.ToLower(domain))
 	
@@ -185,6 +257,9 @@ func (re *RegistrarEngine) commitOwnership(domain, ownerPub, parent string) erro
 	defer re.mu.Unlock()
 
 	if existing, err := re.GetOwnership(domain); err == nil {
+		if existing.OwnerPub != ownerPub {
+			return fmt.Errorf("%w: zone %s is held by another identity", ErrTransferDisabled, domain)
+		}
 		return fmt.Errorf("namespace collision: zone is already held by %s", existing.OwnerPub)
 	}
 
@@ -229,6 +304,7 @@ func MountRegistrarRoutes(module RouteModule, engine *RegistrarEngine) {
 	module.Secure("POST /registry/subdomain", h.HandleRegisterSubdomain)
 	module.Secure("POST /registry/dns/record", h.HandleMaintainDNS)
 	module.Secure("POST /registry/ui/layout", h.HandleSaveLayout)
+	module.Secure("POST /registry/transfer", h.HandleTransfer)
 }
 
 func (h *RegistrarHandler) HandleLookup(w http.ResponseWriter, req *http.Request) {
@@ -302,6 +378,10 @@ func (h *RegistrarHandler) HandleMaintainDNS(w http.ResponseWriter, req *http.Re
 		return
 	}
 	_, _ = w.Write([]byte(`{"status":"DNS resource parameters signed and deployed"}`))
+}
+
+func (h *RegistrarHandler) HandleTransfer(w http.ResponseWriter, req *http.Request) {
+	http.Error(w, ErrTransferDisabled.Error(), http.StatusForbidden)
 }
 
 func (h *RegistrarHandler) HandleSaveLayout(w http.ResponseWriter, req *http.Request) {
